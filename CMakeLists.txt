@@ -1,0 +1,17 @@
+idf_component_register(
+    SRCS
+        "src/ble_provisioning.c"
+        "src/ble_gatts_module.c"
+        "src/ble_proto_parser.c"
+        "src/wifi_driver.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "src"
+    REQUIRES
+        nvs_flash
+        esp_wifi
+        esp_event
+        bt
+        json
+)
