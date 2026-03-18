@@ -1,6 +1,8 @@
 name: "ble_provisioning"
-version: "1.0.0"
+version: "1.0.1"
 description: "BLE Provisioning component for ESP32"
+url: "https://github.com/dxbsw/ble_provisioning"
+license: "MIT"
 dependencies:
   idf:
     version: ">=5.3.0"

@@ -20,7 +20,7 @@
 ## 目录结构
 
 ```
-ble/
+ble_provisioning/
 ├── include/
 │   └── ble_provisioning.h   # 对外公共接口
 ├── src/
@@ -38,6 +38,27 @@ ble/
 ├── CMakeLists.txt           # 构建脚本
 ├── PROTOCOL.md              # 通信协议文档
 └── README.md                # 组件说明文档
+```
+
+## 作为依赖引入
+
+### 方式 A：从 Git 仓库（推荐用于开发）
+
+在项目 `main/idf_component.yml`（或任意需要依赖它的组件清单）中添加：
+
+```yaml
+dependencies:
+  ble_provisioning:
+    git: "https://github.com/dxbsw/ble_provisioning.git"
+    version: "v1.0.1"
+```
+
+### 方式 B：从组件中心（发布后使用）
+
+```yaml
+dependencies:
+  dxbsw/ble_provisioning:
+    version: "^1.0.1"
 ```
 
 ## 依赖 (Dependencies)
