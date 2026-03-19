@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -49,6 +51,8 @@ esp_err_t ble_provisioning_start(void);
  * @return esp_err_t 成功返回 ESP_OK
  */
 esp_err_t ble_provisioning_stop(void);
+
+bool ble_provisioning_is_connected(void);
 
 #ifdef __cplusplus
 }

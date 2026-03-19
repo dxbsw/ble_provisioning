@@ -111,3 +111,8 @@ esp_err_t ble_provisioning_stop(void)
 {
     return ble_gatts_module_stop_adv();
 }
+
+bool ble_provisioning_is_connected(void)
+{
+    return wifi_driver_is_connected();
+}
