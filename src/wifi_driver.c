@@ -1,12 +1,15 @@
 #include "wifi_driver.h"
+
 #include <string.h>
+
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
-#include "nvs_flash.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 
 static const char *TAG = "WIFI_DRIVER";
 
@@ -15,6 +18,40 @@ static const char *TAG = "WIFI_DRIVER";
 
 static EventGroupHandle_t s_wifi_event_group;
 static bool s_is_connected = false;
+static TaskHandle_t s_reconnect_task_handle = NULL;
+static int s_reconnect_attempts = 0;
+
+#define WIFI_RECONNECT_MAX_ATTEMPTS 10
+#define WIFI_RECONNECT_BASE_DELAY_MS 1000
+#define WIFI_RECONNECT_MAX_DELAY_MS 30000
+#define WIFI_RECONNECT_SETTLE_MS 5000
+
+static void wifi_reconnect_task(void *param)
+{
+    while (!s_is_connected && s_reconnect_attempts < WIFI_RECONNECT_MAX_ATTEMPTS) {
+        int delay_ms = WIFI_RECONNECT_BASE_DELAY_MS << s_reconnect_attempts;
+        if (delay_ms > WIFI_RECONNECT_MAX_DELAY_MS) {
+            delay_ms = WIFI_RECONNECT_MAX_DELAY_MS;
+        }
+
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(delay_ms));
+        if (s_is_connected) {
+            break;
+        }
+
+        ESP_LOGI(TAG, "自动重连尝试 %d/%d", s_reconnect_attempts + 1, WIFI_RECONNECT_MAX_ATTEMPTS);
+        esp_err_t ret = esp_wifi_connect();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "自动重连触发失败: %s", esp_err_to_name(ret));
+        }
+        s_reconnect_attempts++;
+
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(WIFI_RECONNECT_SETTLE_MS));
+    }
+
+    s_reconnect_task_handle = NULL;
+    vTaskDelete(NULL);
+}
 
 // 事件处理回调函数
 static void event_handler(void* arg, esp_event_base_t event_base,
@@ -27,12 +64,24 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         if (s_wifi_event_group) {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
+        if (s_reconnect_task_handle == NULL) {
+            if (xTaskCreate(wifi_reconnect_task, "wifi_reconn", 4096, NULL, 5, &s_reconnect_task_handle) != pdPASS) {
+                s_reconnect_task_handle = NULL;
+                ESP_LOGE(TAG, "创建自动重连任务失败");
+            }
+        } else {
+            xTaskNotifyGive(s_reconnect_task_handle);
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "获取到 IP:" IPSTR, IP2STR(&event->ip_info.ip));
         s_is_connected = true;
+        s_reconnect_attempts = 0;
         if (s_wifi_event_group) {
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        }
+        if (s_reconnect_task_handle) {
+            xTaskNotifyGive(s_reconnect_task_handle);
         }
     }
 }
@@ -43,27 +92,59 @@ esp_err_t wifi_driver_init(void)
     if (initialized) return ESP_OK;
 
     s_wifi_event_group = xEventGroupCreate();
+    if (s_wifi_event_group == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_err_t ret = esp_netif_init();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        return ret;
+    }
+
+    ret = esp_event_loop_create_default();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        return ret;
+    }
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ret = esp_wifi_init(&cfg);
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+    ret = esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
                                                         &event_handler,
                                                         NULL,
-                                                        NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        NULL);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = esp_event_handler_instance_register(IP_EVENT,
                                                         IP_EVENT_STA_GOT_IP,
                                                         &event_handler,
                                                         NULL,
-                                                        NULL));
+                                                        NULL);
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    ret = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
     initialized = true;
     ESP_LOGI(TAG, "WiFi 驱动初始化完成。");
@@ -82,14 +163,17 @@ esp_err_t wifi_driver_scan(wifi_ap_record_t *ap_list, uint16_t *ap_count)
         .show_hidden = true
     };
 
-    ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_config, true));
-    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_num));
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+    if (err != ESP_OK) return err;
+    err = esp_wifi_scan_get_ap_num(&ap_num);
+    if (err != ESP_OK) return err;
     
     if (ap_num > number) {
         ap_num = number;
     }
     
-    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_num, ap_list));
+    err = esp_wifi_scan_get_ap_records(&ap_num, ap_list);
+    if (err != ESP_OK) return err;
     *ap_count = ap_num;
     return ESP_OK;
 }
@@ -98,9 +182,21 @@ esp_err_t wifi_driver_connect(const char *ssid, const char *password)
 {
     if (!ssid) return ESP_ERR_INVALID_ARG;
 
+    if (s_reconnect_task_handle) {
+        vTaskDelete(s_reconnect_task_handle);
+        s_reconnect_task_handle = NULL;
+    }
+    s_reconnect_attempts = 0;
+
     wifi_config_t wifi_config = {
         .sta = {
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .scan_method = WIFI_ALL_CHANNEL_SCAN,
+            .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
+            .threshold = {
+                .rssi = -80,
+                .authmode = WIFI_AUTH_WPA_WPA2_PSK,
+            },
+            .failure_retry_cnt = 3,
             .pmf_cfg = {
                 .capable = true,
                 .required = false
@@ -113,17 +209,20 @@ esp_err_t wifi_driver_connect(const char *ssid, const char *password)
     }
 
     ESP_LOGI(TAG, "正在连接到 %s...", ssid);
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    esp_wifi_disconnect();
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) return err;
     
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     
-    esp_wifi_connect();
+    err = esp_wifi_connect();
+    if (err != ESP_OK) return err;
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
             pdFALSE,
             pdFALSE,
-            pdMS_TO_TICKS(10000));
+            pdMS_TO_TICKS(15000));
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "已连接到 AP SSID:%s", ssid);

@@ -16,21 +16,26 @@
 *   **扩展性**：
     *   提供 Python 上位机测试工具。
     *   预留重启前的 Hook 函数，方便二次开发。
+    *   支持注册自定义协议处理回调（外部扩展自己的通信协议）。
+    *   BLE 连接建立后自动触发一次 WiFi 扫描，并通过 Notify 上报扫描结果。
+    *   sys_info / sw_info / state 字段支持默认值 + NVS 持久化配置。
 
 ## 目录结构
 
 ```
 ble_provisioning/
 ├── include/
-│   └── ble_provisioning.h   # 对外公共接口
+│   ├── ble_provisioning.h   # 对外公共接口
+│   ├── config.h             # 设备信息配置（默认值 + NVS）
+│   └── wifi_driver.h        # WiFi 驱动对外接口
 ├── src/
 │   ├── ble_provisioning.c   # 核心配网逻辑
 │   ├── ble_gatts_module.c   # BLE GATT Server 实现
 │   ├── ble_gatts_module.h   # BLE 模块内部头文件
 │   ├── ble_proto_parser.c   # 协议解析与指令处理
 │   ├── ble_proto_parser.h   # 协议解析器头文件
-│   ├── wifi_driver.c        # WiFi 驱动封装
-│   └── wifi_driver.h        # WiFi 驱动头文件
+│   ├── config.c             # 设备信息配置（NVS 读写实现）
+│   └── wifi_driver.c        # WiFi 驱动封装
 ├── python_tool/             # Python 上位机测试工具
 │   ├── ble_test.py          # 测试脚本
 │   ├── requirements.txt     # 依赖库
@@ -50,7 +55,7 @@ ble_provisioning/
 dependencies:
   ble_provisioning:
     git: "https://github.com/dxbsw/ble_provisioning.git"
-    version: "v1.0.1"
+    version: "v1.0.4"
 ```
 
 ### 方式 B：从组件中心（发布后使用）
@@ -58,7 +63,7 @@ dependencies:
 ```yaml
 dependencies:
   dxbsw/ble_provisioning:
-    version: "^1.0.1"
+    version: "^1.0.4"
 ```
 
 ## 依赖 (Dependencies)
@@ -102,7 +107,7 @@ void app_main(void)
 
     // 初始化 BLE 配网组件
     // 这会自动初始化 NVS、WiFi，并根据情况启动连接或配网
-    esp_err_t err = ble_provisioning_init(&config);
+    esp_err_t err = ble_provisioning_init(&config, true);
     
     if (err != ESP_OK) {
         // 错误处理
@@ -114,6 +119,10 @@ void app_main(void)
     }
 }
 ```
+
+`init_nvs` 参数说明：
+*   传 `true`：由组件内部调用 `nvs_flash_init()`（适合大多数工程）。
+*   传 `false`：组件不初始化 NVS，要求外部已完成 NVS 初始化（适合你在 app_main 里统一初始化的工程）。
 
 ### 3. 自定义配置
 
@@ -139,6 +148,96 @@ void pre_restart_hook(void) {
     // disable_peripherals();
 }
 ```
+
+## 新功能使用示例
+
+### 1) BLE 连接后自动上报 WiFi 扫描结果
+
+设备 BLE 连接建立后，会自动触发一次 WiFi 扫描，并通过 Notify 上报（格式与 `CMD_WIFI_SCAN` 的响应一致，详见 `PROTOCOL.md`）。
+
+如需手动触发，也可以在应用层调用：
+
+```c
+ble_provisioning_scan_and_notify();
+```
+
+### 2) 自定义协议钩子：JSON Echo（手机发什么，设备回什么）
+
+你可以在外部注册自定义协议回调，拦截 Command 写入数据并生成自定义响应。下面示例约定 `cmd=9000` 为测试命令：手机发送 JSON，设备通过 Notify 回显 `data` 字段。
+
+```c
+#include <string.h>
+#include "ble_provisioning.h"
+#include "cJSON.h"
+
+static esp_err_t my_json_echo(void *user_ctx,
+                             const uint8_t *data,
+                             size_t len,
+                             char *response,
+                             size_t response_len)
+{
+    cJSON *req = cJSON_ParseWithLength((const char *)data, len);
+    if (req == NULL) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    cJSON *cmd_item = cJSON_GetObjectItem(req, "cmd");
+    if (cmd_item == NULL || !cJSON_IsNumber(cmd_item) || cmd_item->valueint != 9000) {
+        cJSON_Delete(req);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    cJSON *res = cJSON_CreateObject();
+    cJSON_AddNumberToObject(res, "cmd", 9000);
+    cJSON_AddStringToObject(res, "status", "success");
+
+    cJSON *data_item = cJSON_GetObjectItem(req, "data");
+    if (data_item != NULL) {
+        cJSON_AddItemToObject(res, "echo", cJSON_Duplicate(data_item, true));
+    }
+
+    bool ok = cJSON_PrintPreallocated(res, response, response_len, false);
+    cJSON_Delete(req);
+    cJSON_Delete(res);
+    if (!ok) {
+        snprintf(response, response_len, "{\"cmd\":9000,\"status\":\"fail\",\"msg\":\"resp too long\"}");
+    }
+    return ESP_OK;
+}
+
+void app_main(void)
+{
+    ble_prov_config_t config = {.device_name = "ESP32-S3-TEXT"};
+    ble_provisioning_init(&config, true);
+    ble_provisioning_set_custom_handler(my_json_echo, NULL);
+}
+```
+
+手机端测试：
+*   连接设备后，找到 **Write/Command** 特征值写入：
+
+```json
+{"cmd":9000,"data":"hello"}
+```
+
+*   打开 **Notify/Status** 特征值通知，接收类似回包：
+
+```json
+{"cmd":9000,"status":"success","echo":"hello"}
+```
+
+说明：
+*   自定义回调优先级高于内置 JSON 协议解析；当回调返回 `ESP_ERR_NOT_SUPPORTED` 等非 `ESP_OK` 时，会回落到内置协议处理。
+*   如需异步处理（例如创建任务、分包发送），回调返回 `BLE_PROV_PROTO_ASYNC`，并在异步流程中自行调用 `ble_provisioning_send_notify()` 上报。
+
+## 更新记录
+
+### v1.0.4
+
+*   新增：自定义协议处理钩子（`ble_provisioning_set_custom_handler` / `ble_provisioning_send_notify`），便于外部扩展自定义通信协议。
+*   新增：BLE 连接建立后自动触发一次 WiFi 扫描，并通过 Notify 上报扫描结果。
+*   新增：设备信息配置（sys_info / sw_info / state）默认值 + NVS 持久化（`include/config.h` / `src/config.c`）。
+*   变更：`ble_provisioning_init()` 增加 `init_nvs` 参数，便于工程统一初始化 NVS。
 
 ## 注意事项
 

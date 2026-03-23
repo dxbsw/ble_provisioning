@@ -1,6 +1,7 @@
 #include "ble_proto_parser.h"
 #include "ble_gatts_module.h"
 #include "wifi_driver.h"
+#include "config.h"
 #include "esp_log.h"
 #include "cJSON.h"
 #include "esp_system.h"
@@ -51,25 +52,28 @@ static void send_async_response(cJSON *res) {
 static esp_err_t handle_connect(cJSON *req, cJSON *res) {
     create_response_base(res, CMD_CONNECT, "success");
     
+    ble_prov_device_config_t cfg;
+    ble_prov_config_get(&cfg);
+
     cJSON *sys_info = cJSON_CreateObject();
-    cJSON_AddStringToObject(sys_info, "name", "ESP32-S3-DEVICE");
-    cJSON_AddStringToObject(sys_info, "mac", "XX:XX:XX:XX:XX:XX");
-    cJSON_AddStringToObject(sys_info, "fw_ver", "1.0.0");
-    cJSON_AddStringToObject(sys_info, "hw_ver", "1.0.0");
-    cJSON_AddStringToObject(sys_info, "proto_ver", "1.0.0");
+    cJSON_AddStringToObject(sys_info, "name", cfg.sys_name);
+    cJSON_AddStringToObject(sys_info, "mac", cfg.mac);
+    cJSON_AddStringToObject(sys_info, "fw_ver", cfg.fw_ver);
+    cJSON_AddStringToObject(sys_info, "hw_ver", cfg.hw_ver);
+    cJSON_AddStringToObject(sys_info, "proto_ver", cfg.proto_ver);
     cJSON_AddItemToObject(res, "sys_info", sys_info);
 
     cJSON *sw_info = cJSON_CreateObject();
-    cJSON_AddStringToObject(sw_info, "name", "ESP32-S3-APP");
-    cJSON_AddStringToObject(sw_info, "ver", "1.0.0");
-    cJSON_AddStringToObject(sw_info, "desc", "BLE Provisioning");
-    cJSON_AddStringToObject(sw_info, "date", "2023-10-27");
+    cJSON_AddStringToObject(sw_info, "name", cfg.sw_name);
+    cJSON_AddStringToObject(sw_info, "ver", cfg.sw_ver);
+    cJSON_AddStringToObject(sw_info, "desc", cfg.sw_desc);
+    cJSON_AddStringToObject(sw_info, "date", cfg.sw_date);
     cJSON_AddItemToObject(res, "sw_info", sw_info);
 
     cJSON *state = cJSON_CreateObject();
     cJSON_AddStringToObject(state, "wifi", wifi_driver_is_connected() ? "connected" : "disconnected");
-    cJSON_AddStringToObject(state, "dev", "normal");
-    cJSON_AddStringToObject(state, "server", "connected");
+    cJSON_AddStringToObject(state, "dev", cfg.state_dev);
+    cJSON_AddStringToObject(state, "server", cfg.state_server);
     cJSON_AddItemToObject(res, "state", state);
 
     return ESP_OK;
@@ -105,7 +109,11 @@ static void wifi_scan_task(void *param) {
 }
 
 static esp_err_t handle_wifi_scan(cJSON *req, cJSON *res) {
-    xTaskCreate(wifi_scan_task, "wifi_scan", 4096, NULL, 5, NULL);
+    if (xTaskCreate(wifi_scan_task, "wifi_scan", 4096, NULL, 5, NULL) != pdPASS) {
+        create_response_base(res, CMD_WIFI_SCAN, "fail");
+        cJSON_AddStringToObject(res, "msg", "task create failed");
+        return ESP_OK;
+    }
     return ESP_BLE_PROTO_ASYNC;
 }
 
@@ -120,7 +128,10 @@ static void wifi_connect_task(void *param) {
     cJSON *res = cJSON_CreateObject();
 
     // 先保存配置
-    wifi_driver_save_config(params->ssid, params->password);
+    esp_err_t save_ret = wifi_driver_save_config(params->ssid, params->password);
+    if (save_ret != ESP_OK) {
+        ESP_LOGW(TAG, "保存 WiFi 配置失败: %s", esp_err_to_name(save_ret));
+    }
 
     // 尝试连接
     esp_err_t err = wifi_driver_connect(params->ssid, params->password);
@@ -158,7 +169,12 @@ static esp_err_t handle_wifi_connect(cJSON *req, cJSON *res) {
         params->password[0] = 0;
     }
 
-    xTaskCreate(wifi_connect_task, "wifi_conn", 4096, params, 5, NULL);
+    if (xTaskCreate(wifi_connect_task, "wifi_conn", 4096, params, 5, NULL) != pdPASS) {
+        free(params);
+        create_response_base(res, CMD_WIFI_CONNECT, "fail");
+        cJSON_AddStringToObject(res, "msg", "task create failed");
+        return ESP_OK;
+    }
     return ESP_BLE_PROTO_ASYNC;
 }
 

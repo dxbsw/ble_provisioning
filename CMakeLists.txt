@@ -3,6 +3,7 @@ idf_component_register(
         "src/ble_provisioning.c"
         "src/ble_gatts_module.c"
         "src/ble_proto_parser.c"
+        "src/config.c"
         "src/wifi_driver.c"
     INCLUDE_DIRS
         "include"

@@ -1,6 +1,8 @@
 #include "ble_provisioning.h"
 #include "ble_gatts_module.h"
 #include "wifi_driver.h"
+#include "ble_proto_parser.h"
+#include "cJSON.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
@@ -75,7 +77,45 @@ static void prov_task(void *param) {
     vTaskDelete(NULL);
 }
 
-esp_err_t ble_provisioning_init(const ble_prov_config_t *config)
+static void wifi_scan_notify_task(void *param) {
+    cJSON *res = cJSON_CreateObject();
+    wifi_ap_record_t ap_list[10];
+    uint16_t ap_count = 10;
+    if (wifi_driver_scan(ap_list, &ap_count) != ESP_OK) {
+        cJSON_AddNumberToObject(res, "cmd", CMD_WIFI_SCAN);
+        cJSON_AddStringToObject(res, "status", "fail");
+        char *json_str = cJSON_PrintUnformatted(res);
+        if (json_str) {
+            ble_gatts_module_send_notify((uint8_t*)json_str, strlen(json_str));
+            cJSON_free(json_str);
+        }
+        cJSON_Delete(res);
+        vTaskDelete(NULL);
+        return;
+    }
+    cJSON_AddNumberToObject(res, "cmd", CMD_WIFI_SCAN);
+    cJSON_AddStringToObject(res, "status", "success");
+    cJSON *scan_res = cJSON_CreateObject();
+    cJSON_AddNumberToObject(scan_res, "count", ap_count);
+    cJSON *list = cJSON_CreateArray();
+    for (int i = 0; i < ap_count; i++) {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "ssid", (char *)ap_list[i].ssid);
+        cJSON_AddNumberToObject(item, "rssi", ap_list[i].rssi);
+        cJSON_AddItemToArray(list, item);
+    }
+    cJSON_AddItemToObject(scan_res, "list", list);
+    cJSON_AddItemToObject(res, "scan_res", scan_res);
+    char *json_str = cJSON_PrintUnformatted(res);
+    if (json_str) {
+        ble_gatts_module_send_notify((uint8_t*)json_str, strlen(json_str));
+        cJSON_free(json_str);
+    }
+    cJSON_Delete(res);
+    vTaskDelete(NULL);
+}
+
+esp_err_t ble_provisioning_init(const ble_prov_config_t *config, bool init_nvs)
 {
     if (config) {
         s_config = *config;
@@ -83,21 +123,42 @@ esp_err_t ble_provisioning_init(const ble_prov_config_t *config)
         s_config.device_name = "ESP32-PROV";
     }
 
-    // 初始化 NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+    if (init_nvs) {
+        esp_err_t ret = nvs_flash_init();
+        if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            ret = nvs_flash_erase();
+            if (ret != ESP_OK) {
+                return ret;
+            }
+            ret = nvs_flash_init();
+        }
+        if (ret != ESP_OK) {
+            return ret;
+        }
     }
-    ESP_ERROR_CHECK(ret);
 
     // 初始化 WiFi 驱动
-    wifi_driver_init();
+    esp_err_t ret = wifi_driver_init();
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
     // 启动配网任务
-    xTaskCreate(prov_task, "prov_task", 4096, NULL, 5, NULL);
+    if (xTaskCreate(prov_task, "prov_task", 4096, NULL, 5, NULL) != pdPASS) {
+        return ESP_FAIL;
+    }
 
     return ESP_OK;
+}
+
+esp_err_t ble_provisioning_set_custom_handler(ble_prov_custom_proto_handler_t handler, void *user_ctx)
+{
+    return ble_gatts_module_set_custom_handler((ble_gatts_custom_proto_handler_t)handler, user_ctx);
+}
+
+esp_err_t ble_provisioning_send_notify(const uint8_t *data, size_t len)
+{
+    return ble_gatts_module_send_notify(data, len);
 }
 
 esp_err_t ble_provisioning_start(void)
@@ -115,4 +176,12 @@ esp_err_t ble_provisioning_stop(void)
 bool ble_provisioning_is_connected(void)
 {
     return wifi_driver_is_connected();
+}
+
+esp_err_t ble_provisioning_scan_and_notify(void)
+{
+    if (xTaskCreate(wifi_scan_notify_task, "wifi_scan_notify", 4096, NULL, 5, NULL) != pdPASS) {
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }

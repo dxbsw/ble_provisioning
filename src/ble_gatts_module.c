@@ -1,5 +1,6 @@
 #include "ble_gatts_module.h"
 #include "ble_proto_parser.h"
+#include "ble_provisioning.h"
 #include "esp_log.h"
 #include "esp_bt.h"
 #include "esp_gap_ble_api.h"
@@ -7,6 +8,7 @@
 #include "esp_gatt_common_api.h"
 #include "esp_bt_defs.h"
 #include "esp_bt_main.h"
+#include <stdio.h>
 #include <string.h>
 
 #define GATTS_TAG "BLE_GATTS"
@@ -28,6 +30,8 @@ static esp_gatt_if_t s_gatts_if = ESP_GATT_IF_NONE;
 static uint16_t s_char_cmd_handle = 0;
 static uint16_t s_char_status_handle = 0;
 static char s_device_name[32] = "ESP32-BLE-PROV";
+static ble_gatts_custom_proto_handler_t s_custom_proto_handler = NULL;
+static void *s_custom_proto_user_ctx = NULL;
 
 static uint8_t service_uuid128[16] = SERVICE_UUID;
 static uint8_t char_cmd_uuid128[16] = CHAR_CMD_UUID;
@@ -133,13 +137,34 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
             if (param->write.handle == s_char_cmd_handle) {
                 // 解析命令
                 char response[512]; // 响应缓冲区
-                esp_err_t err = ble_proto_parse_json(param->write.value, param->write.len, response, sizeof(response));
-                
-                if (err == ESP_OK) {
-                    // 立即通过 Notify 发送响应
-                    ble_gatts_module_send_notify((uint8_t*)response, strlen(response));
+                bool handled = false;
+
+                if (s_custom_proto_handler != NULL) {
+                    memset(response, 0, sizeof(response));
+                    esp_err_t custom_ret = s_custom_proto_handler(s_custom_proto_user_ctx,
+                                                                 param->write.value,
+                                                                 param->write.len,
+                                                                 response,
+                                                                 sizeof(response));
+                    if (custom_ret == ESP_OK) {
+                        ble_gatts_module_send_notify((uint8_t*)response, strlen(response));
+                        handled = true;
+                    }
+                    if (custom_ret == BLE_PROV_PROTO_ASYNC) {
+                        handled = true;
+                    }
                 }
-                // 如果是 ESP_BLE_PROTO_ASYNC，则在此不做任何操作（任务会处理通知）
+
+                if (!handled) {
+                    esp_err_t err = ble_proto_parse_json(param->write.value, param->write.len, response, sizeof(response));
+                    if (err == ESP_OK) {
+                        ble_gatts_module_send_notify((uint8_t*)response, strlen(response));
+                    } else if (err == ESP_BLE_PROTO_ASYNC) {
+                    } else {
+                        const char *msg = "{\"cmd\":-1,\"status\":\"fail\",\"msg\":\"invalid request\"}";
+                        ble_gatts_module_send_notify((const uint8_t*)msg, strlen(msg));
+                    }
+                }
             }
         }
         if (param->write.need_rsp){
@@ -224,6 +249,7 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
         s_conn_id = param->connect.conn_id;
         s_gatts_if = gatts_if;
         esp_ble_gap_update_conn_params(&conn_params);
+        ble_provisioning_scan_and_notify();
         break;
     }
     case ESP_GATTS_DISCONNECT_EVT:
@@ -344,4 +370,11 @@ esp_err_t ble_gatts_module_send_notify(const uint8_t *data, size_t len)
     
     return esp_ble_gatts_send_indicate(s_gatts_if, s_conn_id, s_char_status_handle,
                                       len, (uint8_t*)data, false);
+}
+
+esp_err_t ble_gatts_module_set_custom_handler(ble_gatts_custom_proto_handler_t handler, void *user_ctx)
+{
+    s_custom_proto_handler = handler;
+    s_custom_proto_user_ctx = user_ctx;
+    return ESP_OK;
 }
