@@ -13,6 +13,36 @@ static const char *TAG = "BLE_PROV";
 
 static ble_prov_config_t s_config;
 
+esp_err_t ble_prov_config_set_runtime_defaults(const ble_prov_device_config_t *cfg);
+
+static void ble_prov_apply_defaults(ble_prov_config_t *cfg)
+{
+    if (!cfg->device_name) {
+        cfg->device_name = "ESP32-PROV";
+    }
+    if (cfg->reconnect_enable == BLE_PROV_OPTION_DEFAULT) {
+        cfg->reconnect_enable = BLE_PROV_OPTION_ENABLE;
+    }
+    if (cfg->reconnect_mode == BLE_PROV_RECONNECT_MODE_DEFAULT) {
+        cfg->reconnect_mode = BLE_PROV_RECONNECT_MODE_LINEAR_STEP;
+    }
+    if (cfg->reconnect_continue_after_max == BLE_PROV_OPTION_DEFAULT) {
+        cfg->reconnect_continue_after_max = BLE_PROV_OPTION_ENABLE;
+    }
+    if (cfg->reconnect_fixed_interval_ms == 0) {
+        cfg->reconnect_fixed_interval_ms = 60000;
+    }
+    if (cfg->reconnect_step_interval_ms == 0) {
+        cfg->reconnect_step_interval_ms = 5000;
+    }
+    if (cfg->reconnect_max_interval_ms == 0) {
+        cfg->reconnect_max_interval_ms = 60000;
+    }
+    if (cfg->reconnect_jitter_ms == 0) {
+        cfg->reconnect_jitter_ms = 1000;
+    }
+}
+
 /**
  * @brief 配网任务
  * 
@@ -25,6 +55,15 @@ static void prov_task(void *param) {
     int config_count = 0;
     esp_err_t err;
     bool connected = false;
+
+    if (s_config.default_wifi_ssid && s_config.default_wifi_ssid[0] != 0) {
+        ESP_LOGI(TAG, "正在尝试默认 WiFi: %s", s_config.default_wifi_ssid);
+        if (wifi_driver_connect(s_config.default_wifi_ssid, s_config.default_wifi_password) == ESP_OK) {
+            connected = true;
+        } else {
+            ESP_LOGW(TAG, "默认 WiFi 连接失败，继续尝试已保存 WiFi");
+        }
+    }
 
     // 1. 检查是否有保存的 WiFi 配置
     err = wifi_driver_get_saved_configs(saved_configs, &config_count);
@@ -117,11 +156,12 @@ static void wifi_scan_notify_task(void *param) {
 
 esp_err_t ble_provisioning_init(const ble_prov_config_t *config, bool init_nvs)
 {
+    memset(&s_config, 0, sizeof(s_config));
     if (config) {
         s_config = *config;
-    } else {
-        s_config.device_name = "ESP32-PROV";
     }
+    ble_prov_apply_defaults(&s_config);
+    ble_prov_config_set_runtime_defaults(&s_config.device_info);
 
     if (init_nvs) {
         esp_err_t ret = nvs_flash_init();
@@ -142,6 +182,28 @@ esp_err_t ble_provisioning_init(const ble_prov_config_t *config, bool init_nvs)
     if (ret != ESP_OK) {
         return ret;
     }
+
+    wifi_driver_reconnect_config_t reconn_cfg = {0};
+    reconn_cfg.enable = (s_config.reconnect_enable == BLE_PROV_OPTION_ENABLE)
+                            ? WIFI_DRIVER_OPTION_ENABLE
+                            : (s_config.reconnect_enable == BLE_PROV_OPTION_DISABLE) ? WIFI_DRIVER_OPTION_DISABLE
+                                                                                     : WIFI_DRIVER_OPTION_DEFAULT;
+    reconn_cfg.mode = (s_config.reconnect_mode == BLE_PROV_RECONNECT_MODE_FIXED)
+                          ? WIFI_DRIVER_RECONNECT_MODE_FIXED
+                          : (s_config.reconnect_mode == BLE_PROV_RECONNECT_MODE_LINEAR_STEP)
+                                ? WIFI_DRIVER_RECONNECT_MODE_LINEAR_STEP
+                                : WIFI_DRIVER_RECONNECT_MODE_DEFAULT;
+    reconn_cfg.continue_after_max =
+        (s_config.reconnect_continue_after_max == BLE_PROV_OPTION_ENABLE)
+            ? WIFI_DRIVER_OPTION_ENABLE
+            : (s_config.reconnect_continue_after_max == BLE_PROV_OPTION_DISABLE) ? WIFI_DRIVER_OPTION_DISABLE
+                                                                                 : WIFI_DRIVER_OPTION_DEFAULT;
+    reconn_cfg.max_attempts = s_config.reconnect_max_attempts;
+    reconn_cfg.fixed_interval_ms = s_config.reconnect_fixed_interval_ms;
+    reconn_cfg.step_interval_ms = s_config.reconnect_step_interval_ms;
+    reconn_cfg.max_interval_ms = s_config.reconnect_max_interval_ms;
+    reconn_cfg.jitter_ms = s_config.reconnect_jitter_ms;
+    wifi_driver_set_reconnect_config(&reconn_cfg);
 
     // 启动配网任务
     if (xTaskCreate(prov_task, "prov_task", 4096, NULL, 5, NULL) != pdPASS) {
@@ -171,6 +233,12 @@ esp_err_t ble_provisioning_start(void)
 esp_err_t ble_provisioning_stop(void)
 {
     return ble_gatts_module_stop_adv();
+}
+
+esp_err_t ble_provisioning_set_reconnect_enabled(bool enabled)
+{
+    wifi_driver_set_reconnect_enabled(enabled);
+    return ESP_OK;
 }
 
 bool ble_provisioning_is_connected(void)

@@ -6,6 +6,7 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_random.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -20,31 +21,95 @@ static EventGroupHandle_t s_wifi_event_group;
 static bool s_is_connected = false;
 static TaskHandle_t s_reconnect_task_handle = NULL;
 static int s_reconnect_attempts = 0;
+static wifi_err_reason_t s_last_disconnect_reason = 0;
+static bool s_last_disconnect_auth_error = false;
+static bool s_reconnect_enabled = true;
+static bool s_continue_after_max = true;
+static wifi_driver_reconnect_mode_t s_reconnect_mode = WIFI_DRIVER_RECONNECT_MODE_LINEAR_STEP;
+static uint32_t s_reconnect_max_attempts = 0;
+static uint32_t s_reconnect_fixed_interval_ms = 60000;
+static uint32_t s_reconnect_step_interval_ms = 5000;
+static uint32_t s_reconnect_max_interval_ms = 60000;
+static uint32_t s_reconnect_jitter_ms = 1000;
 
-#define WIFI_RECONNECT_MAX_ATTEMPTS 10
-#define WIFI_RECONNECT_BASE_DELAY_MS 1000
-#define WIFI_RECONNECT_MAX_DELAY_MS 30000
 #define WIFI_RECONNECT_SETTLE_MS 5000
+
+static bool is_auth_error_reason(wifi_err_reason_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT:
+    case WIFI_REASON_IE_INVALID:
+    case WIFI_REASON_MIC_FAILURE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static uint32_t calc_reconnect_delay_ms(uint32_t attempt_index)
+{
+    uint32_t delay_ms = 0;
+
+    if (s_reconnect_mode == WIFI_DRIVER_RECONNECT_MODE_FIXED) {
+        delay_ms = s_reconnect_fixed_interval_ms;
+    } else {
+        uint64_t linear = (uint64_t)s_reconnect_step_interval_ms * (uint64_t)(attempt_index + 1);
+        if (linear > UINT32_MAX) {
+            linear = UINT32_MAX;
+        }
+        delay_ms = (uint32_t)linear;
+    }
+
+    if (s_reconnect_max_interval_ms > 0 && delay_ms > s_reconnect_max_interval_ms) {
+        delay_ms = s_reconnect_max_interval_ms;
+    }
+
+    if (s_reconnect_jitter_ms > 0) {
+        delay_ms += (esp_random() % (s_reconnect_jitter_ms + 1));
+    }
+
+    return delay_ms;
+}
 
 static void wifi_reconnect_task(void *param)
 {
-    while (!s_is_connected && s_reconnect_attempts < WIFI_RECONNECT_MAX_ATTEMPTS) {
-        int delay_ms = WIFI_RECONNECT_BASE_DELAY_MS << s_reconnect_attempts;
-        if (delay_ms > WIFI_RECONNECT_MAX_DELAY_MS) {
-            delay_ms = WIFI_RECONNECT_MAX_DELAY_MS;
+    while (!s_is_connected) {
+        if (!s_reconnect_enabled) {
+            break;
         }
-
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(delay_ms));
-        if (s_is_connected) {
+        if (s_last_disconnect_auth_error) {
             break;
         }
 
-        ESP_LOGI(TAG, "自动重连尝试 %d/%d", s_reconnect_attempts + 1, WIFI_RECONNECT_MAX_ATTEMPTS);
+        if (s_reconnect_max_attempts > 0 && (uint32_t)s_reconnect_attempts >= s_reconnect_max_attempts) {
+            if (!s_continue_after_max) {
+                break;
+            }
+        }
+
+        uint32_t attempt_index = (uint32_t)s_reconnect_attempts;
+        if (s_reconnect_max_attempts > 0 && attempt_index >= s_reconnect_max_attempts) {
+            attempt_index = s_reconnect_max_attempts - 1;
+        }
+
+        uint32_t delay_ms = calc_reconnect_delay_ms(attempt_index);
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(delay_ms));
+        if (s_is_connected || !s_reconnect_enabled || s_last_disconnect_auth_error) {
+            break;
+        }
+
+        ESP_LOGI(TAG, "自动重连尝试 %d", s_reconnect_attempts + 1);
         esp_err_t ret = esp_wifi_connect();
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "自动重连触发失败: %s", esp_err_to_name(ret));
         }
-        s_reconnect_attempts++;
+
+        if (s_reconnect_attempts < INT32_MAX) {
+            s_reconnect_attempts++;
+        }
 
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(WIFI_RECONNECT_SETTLE_MS));
     }
@@ -60,10 +125,25 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         // 在这里不自动连接，由 wifi_driver_connect 手动触发
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
+        s_last_disconnect_reason = event ? event->reason : 0;
+        s_last_disconnect_auth_error = is_auth_error_reason(s_last_disconnect_reason);
         s_is_connected = false;
         if (s_wifi_event_group) {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
+
+        if (s_last_disconnect_auth_error) {
+            if (s_reconnect_task_handle) {
+                xTaskNotifyGive(s_reconnect_task_handle);
+            }
+            return;
+        }
+
+        if (!s_reconnect_enabled) {
+            return;
+        }
+
         if (s_reconnect_task_handle == NULL) {
             if (xTaskCreate(wifi_reconnect_task, "wifi_reconn", 4096, NULL, 5, &s_reconnect_task_handle) != pdPASS) {
                 s_reconnect_task_handle = NULL;
@@ -77,6 +157,8 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "获取到 IP:" IPSTR, IP2STR(&event->ip_info.ip));
         s_is_connected = true;
         s_reconnect_attempts = 0;
+        s_last_disconnect_reason = 0;
+        s_last_disconnect_auth_error = false;
         if (s_wifi_event_group) {
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         }
@@ -151,6 +233,78 @@ esp_err_t wifi_driver_init(void)
     return ESP_OK;
 }
 
+esp_err_t wifi_driver_set_reconnect_config(const wifi_driver_reconnect_config_t *cfg)
+{
+    if (!cfg) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (cfg->enable == WIFI_DRIVER_OPTION_ENABLE) {
+        s_reconnect_enabled = true;
+    } else if (cfg->enable == WIFI_DRIVER_OPTION_DISABLE) {
+        s_reconnect_enabled = false;
+    }
+
+    if (cfg->continue_after_max == WIFI_DRIVER_OPTION_ENABLE) {
+        s_continue_after_max = true;
+    } else if (cfg->continue_after_max == WIFI_DRIVER_OPTION_DISABLE) {
+        s_continue_after_max = false;
+    }
+
+    if (cfg->mode != WIFI_DRIVER_RECONNECT_MODE_DEFAULT) {
+        s_reconnect_mode = cfg->mode;
+    }
+
+    if (cfg->max_attempts != 0) {
+        s_reconnect_max_attempts = cfg->max_attempts;
+    }
+
+    if (cfg->fixed_interval_ms != 0) {
+        s_reconnect_fixed_interval_ms = cfg->fixed_interval_ms;
+    }
+
+    if (cfg->step_interval_ms != 0) {
+        s_reconnect_step_interval_ms = cfg->step_interval_ms;
+    }
+
+    if (cfg->max_interval_ms != 0) {
+        s_reconnect_max_interval_ms = cfg->max_interval_ms;
+    }
+
+    if (cfg->jitter_ms != 0) {
+        s_reconnect_jitter_ms = cfg->jitter_ms;
+    }
+
+    if (!s_reconnect_enabled && s_reconnect_task_handle) {
+        xTaskNotifyGive(s_reconnect_task_handle);
+    }
+
+    return ESP_OK;
+}
+
+void wifi_driver_set_reconnect_enabled(bool enabled)
+{
+    s_reconnect_enabled = enabled;
+    if (!enabled && s_reconnect_task_handle) {
+        xTaskNotifyGive(s_reconnect_task_handle);
+    }
+}
+
+bool wifi_driver_get_reconnect_enabled(void)
+{
+    return s_reconnect_enabled;
+}
+
+wifi_err_reason_t wifi_driver_get_last_disconnect_reason(void)
+{
+    return s_last_disconnect_reason;
+}
+
+bool wifi_driver_last_disconnect_is_auth_error(void)
+{
+    return s_last_disconnect_auth_error;
+}
+
 esp_err_t wifi_driver_scan(wifi_ap_record_t *ap_list, uint16_t *ap_count)
 {
     uint16_t number = *ap_count;
@@ -187,6 +341,8 @@ esp_err_t wifi_driver_connect(const char *ssid, const char *password)
         s_reconnect_task_handle = NULL;
     }
     s_reconnect_attempts = 0;
+    s_last_disconnect_reason = 0;
+    s_last_disconnect_auth_error = false;
 
     wifi_config_t wifi_config = {
         .sta = {

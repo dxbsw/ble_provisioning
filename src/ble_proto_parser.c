@@ -127,17 +127,25 @@ static void wifi_connect_task(void *param) {
     connect_params_t *params = (connect_params_t *)param;
     cJSON *res = cJSON_CreateObject();
 
-    // 先保存配置
-    esp_err_t save_ret = wifi_driver_save_config(params->ssid, params->password);
-    if (save_ret != ESP_OK) {
-        ESP_LOGW(TAG, "保存 WiFi 配置失败: %s", esp_err_to_name(save_ret));
-    }
-
     // 尝试连接
     esp_err_t err = wifi_driver_connect(params->ssid, params->password);
     
     create_response_base(res, CMD_WIFI_CONNECT, err == ESP_OK ? "success" : "fail");
-    cJSON_AddStringToObject(res, "msg", err == ESP_OK ? "connected" : "connect failed");
+    if (err == ESP_OK) {
+        esp_err_t save_ret = wifi_driver_save_config(params->ssid, params->password);
+        if (save_ret != ESP_OK) {
+            ESP_LOGW(TAG, "保存 WiFi 配置失败: %s", esp_err_to_name(save_ret));
+        }
+        cJSON_AddStringToObject(res, "msg", "connected");
+    } else {
+        wifi_err_reason_t reason = wifi_driver_get_last_disconnect_reason();
+        if (wifi_driver_last_disconnect_is_auth_error()) {
+            cJSON_AddStringToObject(res, "msg", "auth failed");
+        } else {
+            cJSON_AddStringToObject(res, "msg", "connect failed");
+        }
+        cJSON_AddNumberToObject(res, "reason", (int)reason);
+    }
 
     send_async_response(res);
     free(params);

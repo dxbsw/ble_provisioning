@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 #include "esp_wifi.h"
@@ -21,6 +22,29 @@ typedef struct {
     char ssid[33];
     char password[65];
 } wifi_config_info_t;
+
+typedef enum {
+    WIFI_DRIVER_OPTION_DEFAULT = 0,
+    WIFI_DRIVER_OPTION_ENABLE = 1,
+    WIFI_DRIVER_OPTION_DISABLE = 2,
+} wifi_driver_option_t;
+
+typedef enum {
+    WIFI_DRIVER_RECONNECT_MODE_DEFAULT = 0,
+    WIFI_DRIVER_RECONNECT_MODE_FIXED = 1,
+    WIFI_DRIVER_RECONNECT_MODE_LINEAR_STEP = 2,
+} wifi_driver_reconnect_mode_t;
+
+typedef struct {
+    wifi_driver_option_t enable;
+    wifi_driver_reconnect_mode_t mode;
+    wifi_driver_option_t continue_after_max;
+    uint32_t max_attempts;
+    uint32_t fixed_interval_ms;
+    uint32_t step_interval_ms;
+    uint32_t max_interval_ms;
+    uint32_t jitter_ms;
+} wifi_driver_reconnect_config_t;
 
 /**
  * @brief 初始化 WiFi STA 驱动与事件回调
@@ -56,6 +80,16 @@ esp_err_t wifi_driver_scan(wifi_ap_record_t *ap_list, uint16_t *ap_count);
  *      - 其他: ESP-IDF 返回的错误码
  */
 esp_err_t wifi_driver_connect(const char *ssid, const char *password);
+
+esp_err_t wifi_driver_set_reconnect_config(const wifi_driver_reconnect_config_t *cfg);
+
+void wifi_driver_set_reconnect_enabled(bool enabled);
+
+bool wifi_driver_get_reconnect_enabled(void);
+
+wifi_err_reason_t wifi_driver_get_last_disconnect_reason(void);
+
+bool wifi_driver_last_disconnect_is_auth_error(void);
 
 /**
  * @brief 保存 WiFi 凭据到 NVS（支持最多 MAX_WIFI_CONFIGS 条，自动去重与前插）

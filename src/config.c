@@ -9,6 +9,13 @@
 
 static const char *NVS_NAMESPACE = "ble_prov";
 static const char *NVS_KEY_DEVICE_CFG = "dev_cfg";
+static ble_prov_device_config_t s_runtime_defaults;
+
+static void ble_prov_copy_if_not_empty(char *dst, size_t dst_size, const char *src)
+{
+    if (dst == NULL || dst_size == 0 || src == NULL || src[0] == 0) return;
+    strlcpy(dst, src, dst_size);
+}
 
 static void ble_prov_config_set_defaults(ble_prov_device_config_t *cfg)
 {
@@ -27,6 +34,21 @@ static void ble_prov_config_set_defaults(ble_prov_device_config_t *cfg)
 
     strlcpy(cfg->state_dev, BLE_PROV_DEFAULT_STATE_DEV, sizeof(cfg->state_dev));
     strlcpy(cfg->state_server, BLE_PROV_DEFAULT_STATE_SERVER, sizeof(cfg->state_server));
+}
+
+static void ble_prov_config_apply_runtime_defaults(ble_prov_device_config_t *cfg)
+{
+    ble_prov_copy_if_not_empty(cfg->sys_name, sizeof(cfg->sys_name), s_runtime_defaults.sys_name);
+    ble_prov_copy_if_not_empty(cfg->mac, sizeof(cfg->mac), s_runtime_defaults.mac);
+    ble_prov_copy_if_not_empty(cfg->fw_ver, sizeof(cfg->fw_ver), s_runtime_defaults.fw_ver);
+    ble_prov_copy_if_not_empty(cfg->hw_ver, sizeof(cfg->hw_ver), s_runtime_defaults.hw_ver);
+    ble_prov_copy_if_not_empty(cfg->proto_ver, sizeof(cfg->proto_ver), s_runtime_defaults.proto_ver);
+    ble_prov_copy_if_not_empty(cfg->sw_name, sizeof(cfg->sw_name), s_runtime_defaults.sw_name);
+    ble_prov_copy_if_not_empty(cfg->sw_ver, sizeof(cfg->sw_ver), s_runtime_defaults.sw_ver);
+    ble_prov_copy_if_not_empty(cfg->sw_desc, sizeof(cfg->sw_desc), s_runtime_defaults.sw_desc);
+    ble_prov_copy_if_not_empty(cfg->sw_date, sizeof(cfg->sw_date), s_runtime_defaults.sw_date);
+    ble_prov_copy_if_not_empty(cfg->state_dev, sizeof(cfg->state_dev), s_runtime_defaults.state_dev);
+    ble_prov_copy_if_not_empty(cfg->state_server, sizeof(cfg->state_server), s_runtime_defaults.state_server);
 }
 
 static bool ble_prov_mac_is_placeholder(const char *mac)
@@ -51,6 +73,7 @@ esp_err_t ble_prov_config_get(ble_prov_device_config_t *out_cfg)
     if (out_cfg == NULL) return ESP_ERR_INVALID_ARG;
 
     ble_prov_config_set_defaults(out_cfg);
+    ble_prov_config_apply_runtime_defaults(out_cfg);
 
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
@@ -69,6 +92,26 @@ esp_err_t ble_prov_config_get(ble_prov_device_config_t *out_cfg)
     }
 
     ble_prov_fill_mac_if_needed(out_cfg);
+    return ESP_OK;
+}
+
+esp_err_t ble_prov_config_set_runtime_defaults(const ble_prov_device_config_t *cfg)
+{
+    memset(&s_runtime_defaults, 0, sizeof(s_runtime_defaults));
+    if (cfg != NULL) {
+        s_runtime_defaults = *cfg;
+        s_runtime_defaults.sys_name[sizeof(s_runtime_defaults.sys_name) - 1] = 0;
+        s_runtime_defaults.mac[sizeof(s_runtime_defaults.mac) - 1] = 0;
+        s_runtime_defaults.fw_ver[sizeof(s_runtime_defaults.fw_ver) - 1] = 0;
+        s_runtime_defaults.hw_ver[sizeof(s_runtime_defaults.hw_ver) - 1] = 0;
+        s_runtime_defaults.proto_ver[sizeof(s_runtime_defaults.proto_ver) - 1] = 0;
+        s_runtime_defaults.sw_name[sizeof(s_runtime_defaults.sw_name) - 1] = 0;
+        s_runtime_defaults.sw_ver[sizeof(s_runtime_defaults.sw_ver) - 1] = 0;
+        s_runtime_defaults.sw_desc[sizeof(s_runtime_defaults.sw_desc) - 1] = 0;
+        s_runtime_defaults.sw_date[sizeof(s_runtime_defaults.sw_date) - 1] = 0;
+        s_runtime_defaults.state_dev[sizeof(s_runtime_defaults.state_dev) - 1] = 0;
+        s_runtime_defaults.state_server[sizeof(s_runtime_defaults.state_server) - 1] = 0;
+    }
     return ESP_OK;
 }
 

@@ -5,6 +5,7 @@
 #include <stdbool.h>
 
 #include "esp_err.h"
+#include "config.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,9 +22,32 @@ extern "C" {
 /**
  * @brief BLE 配网配置结构体
  */
+typedef enum {
+    BLE_PROV_OPTION_DEFAULT = 0,
+    BLE_PROV_OPTION_ENABLE = 1,
+    BLE_PROV_OPTION_DISABLE = 2,
+} ble_prov_option_t;
+
+typedef enum {
+    BLE_PROV_RECONNECT_MODE_DEFAULT = 0,
+    BLE_PROV_RECONNECT_MODE_FIXED = 1,
+    BLE_PROV_RECONNECT_MODE_LINEAR_STEP = 2,
+} ble_prov_reconnect_mode_t;
+
 typedef struct {
     const char *device_name;    /**< BLE 设备名称 */
-    // 如果需要，可以在此处添加其他配置项
+    ble_prov_option_t reconnect_enable;
+    ble_prov_reconnect_mode_t reconnect_mode;
+    ble_prov_option_t reconnect_continue_after_max;
+    uint32_t reconnect_max_attempts;
+    uint32_t reconnect_fixed_interval_ms;
+    uint32_t reconnect_step_interval_ms;
+    uint32_t reconnect_max_interval_ms;
+    uint32_t reconnect_jitter_ms;
+    const char *default_wifi_ssid;
+    const char *default_wifi_password;
+    /** Connect 响应中的设备信息默认值，留空字段继续使用 config.h 中的默认值 */
+    ble_prov_device_config_t device_info;
 } ble_prov_config_t;
 
 /**
@@ -58,9 +82,10 @@ typedef esp_err_t (*ble_prov_custom_proto_handler_t)(void *user_ctx,
  * 
  * 该函数将执行以下操作：
  * 1. 可选初始化 NVS（由 init_nvs 控制）
- * 2. 检查 NVS 中是否保存了 WiFi 凭据
- * 3. 如果存在保存的 WiFi，尝试连接（重试 5 次，循环 3 轮）
- * 4. 如果连接失败或没有保存的 WiFi，启动 BLE 配网模式
+ * 2. 应用 config.device_info 中传入的设备信息默认值
+ * 3. 检查 NVS 中是否保存了 WiFi 凭据
+ * 4. 如果存在保存的 WiFi，尝试连接（重试 5 次，循环 3 轮）
+ * 5. 如果连接失败或没有保存的 WiFi，启动 BLE 配网模式
  * 
  * @param config 配置结构体指针
  * @param init_nvs 是否在组件内部初始化 NVS（true: 调用 nvs_flash_init；false: 跳过，要求外部自行初始化）
@@ -95,6 +120,8 @@ esp_err_t ble_provisioning_start(void);
  * @return esp_err_t 成功返回 ESP_OK
  */
 esp_err_t ble_provisioning_stop(void);
+
+esp_err_t ble_provisioning_set_reconnect_enabled(bool enabled);
 
 /**
  * @brief 查询当前 WiFi 是否已连接

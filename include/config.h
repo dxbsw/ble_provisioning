@@ -6,17 +6,36 @@
 extern "C" {
 #endif
 
+/**
+ * @brief Connect 响应中 sys_info 字段的默认值
+ */
+/** 设备名称 */
 #define BLE_PROV_DEFAULT_SYS_NAME "ESP32-S3-DEVICE"
+/** 固件版本 */
 #define BLE_PROV_DEFAULT_FW_VER "1.0.0"
+/** 硬件版本 */
 #define BLE_PROV_DEFAULT_HW_VER "1.0.0"
+/** 协议版本 */
 #define BLE_PROV_DEFAULT_PROTO_VER "1.0.0"
 
+/**
+ * @brief Connect 响应中 sw_info 字段的默认值
+ */
+/** 软件名称 */
 #define BLE_PROV_DEFAULT_SW_NAME "ESP32-S3-APP"
+/** 软件版本 */
 #define BLE_PROV_DEFAULT_SW_VER "1.0.0"
+/** 软件描述 */
 #define BLE_PROV_DEFAULT_SW_DESC "BLE Provisioning"
+/** 软件发布日期 */
 #define BLE_PROV_DEFAULT_SW_DATE "2023-10-27"
 
+/**
+ * @brief Connect 响应中 state 字段的默认值
+ */
+/** 设备状态 */
 #define BLE_PROV_DEFAULT_STATE_DEV "normal"
+/** 服务端状态 */
 #define BLE_PROV_DEFAULT_STATE_SERVER "connected"
 
 /**

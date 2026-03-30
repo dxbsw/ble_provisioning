@@ -18,7 +18,7 @@
     *   预留重启前的 Hook 函数，方便二次开发。
     *   支持注册自定义协议处理回调（外部扩展自己的通信协议）。
     *   BLE 连接建立后自动触发一次 WiFi 扫描，并通过 Notify 上报扫描结果。
-    *   sys_info / sw_info / state 字段支持默认值 + NVS 持久化配置。
+    *   Connect 响应中的 `sys_info / sw_info / state` 字段支持外部传入默认值，并可保存到 NVS 持久化。
 
 ## 目录结构
 
@@ -55,7 +55,7 @@ ble_provisioning/
 dependencies:
   ble_provisioning:
     git: "https://github.com/dxbsw/ble_provisioning.git"
-    version: "v1.0.4"
+    version: "v1.0.5"
 ```
 
 ### 方式 B：从组件中心（发布后使用）
@@ -63,7 +63,7 @@ dependencies:
 ```yaml
 dependencies:
   dxbsw/ble_provisioning:
-    version: "^1.0.4"
+    version: "^1.0.5"
 ```
 
 ## 依赖 (Dependencies)
@@ -103,6 +103,18 @@ void app_main(void)
     // 定义配置
     ble_prov_config_t config = {
         .device_name = "ESP32-S3-TEXT", // 自定义蓝牙广播名称
+        .device_info = {
+            .sys_name = "ESP32-S3-DEVICE",
+            .fw_ver = "1.0.1",
+            .hw_ver = "1.0.0",
+            .proto_ver = "1.0.0",
+            .sw_name = "ESP32-S3-APP",
+            .sw_ver = "1.0.1",
+            .sw_desc = "BLE Provisioning",
+            .sw_date = __DATE__,
+            .state_dev = "normal",
+            .state_server = "connected",
+        },
     };
 
     // 初始化 BLE 配网组件
@@ -147,6 +159,96 @@ void pre_restart_hook(void) {
     // save_user_data();
     // disable_peripherals();
 }
+```
+
+#### 3.3 外部传入设备信息默认值
+
+`ble_prov_config_t` 新增了 `device_info` 字段，用于配置 BLE Connect 响应中的 `sys_info / sw_info / state` 内容。  
+这些值会在 `ble_provisioning_init()` 时作为运行时默认值注入；如果某个字段留空，组件会继续回退到 `include/config.h` 中定义的默认值。
+
+对应字段定义见 [config.h](file:///d:/Project/sundries/BLE_TEST/components/ble_provisioning/include/config.h#L46-L60)：
+
+```c
+typedef struct {
+    char sys_name[32];
+    char mac[18];
+    char fw_ver[16];
+    char hw_ver[16];
+    char proto_ver[16];
+
+    char sw_name[32];
+    char sw_ver[16];
+    char sw_desc[64];
+    char sw_date[16];
+
+    char state_dev[16];
+    char state_server[16];
+} ble_prov_device_config_t;
+```
+
+示例：
+
+```c
+ble_prov_config_t config = {
+    .device_name = "ESP32-S3-TEXT",
+    .device_info = {
+        .sys_name = "ESP32-S3-DEVICE",
+        .fw_ver = "1.0.1",
+        .hw_ver = "1.0.0",
+        .proto_ver = "1.0.0",
+        .sw_name = "ESP32-S3-APP",
+        .sw_ver = "1.0.1",
+        .sw_desc = "BLE Provisioning",
+        .sw_date = __DATE__,
+        .state_dev = "normal",
+        .state_server = "connected",
+    },
+};
+
+ble_provisioning_init(&config, true);
+```
+
+补充说明：
+*   `mac` 可不传。若未设置或仍为占位符，组件会自动读取芯片真实 MAC 填充。
+*   外部传入的是“默认值”，当 NVS 中已经保存过配置时，读取结果会优先使用 NVS 中的值。
+*   字符串长度需满足结构体字段限制，超长内容会被截断。
+
+#### 3.4 保存设备信息到 NVS
+
+如果应用层希望把新的设备信息持久化到 NVS，可直接调用 `ble_prov_config_set()`。保存位置为：
+
+*   namespace: `ble_prov`
+*   key: `dev_cfg`
+
+示例：
+
+```c
+#include "config.h"
+
+void save_device_info(void)
+{
+    ble_prov_device_config_t cfg = {
+        .sys_name = "ESP32-S3-DEVICE",
+        .fw_ver = "1.0.2",
+        .hw_ver = "1.0.0",
+        .proto_ver = "1.0.0",
+        .sw_name = "ESP32-S3-APP",
+        .sw_ver = "1.0.2",
+        .sw_desc = "BLE Provisioning",
+        .sw_date = __DATE__,
+        .state_dev = "normal",
+        .state_server = "connected",
+    };
+
+    ESP_ERROR_CHECK(ble_prov_config_set(&cfg));
+}
+```
+
+如需读取当前生效配置，可调用 `ble_prov_config_get()`：
+
+```c
+ble_prov_device_config_t current_cfg;
+ESP_ERROR_CHECK(ble_prov_config_get(&current_cfg));
 ```
 
 ## 新功能使用示例
@@ -232,11 +334,15 @@ void app_main(void)
 
 ## 更新记录
 
+### v1.0.5
+
+*   文档更新：补充 `ble_prov_config_t.device_info` 的外部传参说明，并补充 `ble_prov_config_set()` / `ble_prov_config_get()` 的 NVS 持久化示例。
+
 ### v1.0.4
 
 *   新增：自定义协议处理钩子（`ble_provisioning_set_custom_handler` / `ble_provisioning_send_notify`），便于外部扩展自定义通信协议。
 *   新增：BLE 连接建立后自动触发一次 WiFi 扫描，并通过 Notify 上报扫描结果。
-*   新增：设备信息配置（sys_info / sw_info / state）默认值 + NVS 持久化（`include/config.h` / `src/config.c`）。
+*   新增：设备信息配置（`sys_info / sw_info / state`）支持通过 `ble_prov_config_t.device_info` 外部传入默认值，并可通过 `ble_prov_config_set()` 保存到 NVS（`include/config.h` / `src/config.c`）。
 *   变更：`ble_provisioning_init()` 增加 `init_nvs` 参数，便于工程统一初始化 NVS。
 
 ## 注意事项
