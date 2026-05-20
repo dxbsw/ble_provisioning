@@ -1,6 +1,5 @@
 import asyncio
 import json
-import sys
 from bleak import BleakScanner, BleakClient
 
 # 定义 UUID
@@ -15,6 +14,15 @@ CHAR_STATUS_UUID = "00000003-0000-1000-8000-00805F9B34FB"
 DEVICE_NAME = "ESP32-S3-TEXT"
 
 client = None
+disconnect_event = asyncio.Event()
+
+
+def disconnected_handler(bleak_client):
+    """
+    处理设备断开事件
+    """
+    disconnect_event.set()
+    print("\n[状态] BLE 已断开。若设备已成功连上 WiFi，可能是固件按配置自动关闭了 BLE。")
 
 def notification_handler(sender, data):
     """
@@ -26,6 +34,18 @@ def notification_handler(sender, data):
         print(f"[JSON] {json.dumps(resp, indent=2, ensure_ascii=False)}")
     except Exception as e:
         print(f"[错误] JSON 解析失败: {e}")
+
+
+async def get_services_compat(bleak_client):
+    """
+    兼容不同 bleak 版本的服务发现接口
+    """
+    get_services = getattr(bleak_client, "get_services", None)
+    if callable(get_services):
+        services = await get_services()
+        if services is not None:
+            return services
+    return bleak_client.services
 
 async def scan_and_connect():
     """
@@ -43,19 +63,22 @@ async def scan_and_connect():
         return False
 
     print(f"找到设备: {device.name} ({device.address})")
-    client = BleakClient(device)
+    disconnect_event.clear()
+    client = BleakClient(device, disconnected_callback=disconnected_handler)
     # 连接设备
     await client.connect()
     print("已连接!")
-    
+
+    services = await get_services_compat(client)
     print("发现的服务:")
-    for service in client.services:
+    for service in services:
         print(f"[服务] {service.uuid}")
         for char in service.characteristics:
             print(f"  [特征值] {char.uuid} ({','.join(char.properties)})")
 
     # 开启通知订阅
     await client.start_notify(CHAR_STATUS_UUID, notification_handler)
+    print("[状态] 已开启 Notify，设备可能会自动上报一次 WiFi 扫描结果。")
     return True
 
 async def send_command(cmd_id, data=None):
@@ -78,11 +101,25 @@ async def send_command(cmd_id, data=None):
     # 写入特征值
     await client.write_gatt_char(CHAR_CMD_UUID, json_str.encode('utf-8'), response=True)
 
+
+async def wait_after_command(seconds=1.0):
+    """
+    等待命令异步响应或设备断开
+    """
+    try:
+        await asyncio.wait_for(disconnect_event.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+
 async def main():
     if not await scan_and_connect():
         return
 
     while True:
+        if not client or not client.is_connected:
+            print("设备当前未连接，程序结束。")
+            break
+
         print("\n--- 菜单 ---")
         print("1. 连接 (获取信息)")
         print("2. WiFi 扫描")
@@ -111,11 +148,15 @@ async def main():
             await send_command(6)
         elif choice == 'q':
             break
+        else:
+            print("无效选择，请重新输入。")
+            continue
         
-        await asyncio.sleep(1) # 等待响应
+        await wait_after_command(2.0)
 
     if client:
-        await client.disconnect()
+        if client.is_connected:
+            await client.disconnect()
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -25,6 +25,7 @@
 | **Status Notify** | `00000003-0000-1000-8000-00805F9B34FB` | Notify / Read | 用于设备上报状态或回复指令 |
 
 > **注意**: 上述 UUID 为示例值，开发时请生成并替换为自定义的 UUID。
+> **注意**: 上位机连接后必须先开启 `Status Notify`，否则无法收到任何协议回包。
 
 ## 3. 数据帧格式 (Data Frame Format)
 
@@ -130,6 +131,10 @@ uint8_t calculate_checksum(const uint8_t *data, size_t len) {
 }
 ```
 
+说明：
+* 设备在 BLE 连接建立且客户端开启 `Status Notify` 后，通常会自动主动上报一次扫描结果。
+* 主动发送 `cmd=2` 时，设备会等待本次扫描完成后，再通过 Notify 返回完整结果。
+
 **设备 -> APP**:
 ```json
 {
@@ -170,6 +175,10 @@ uint8_t calculate_checksum(const uint8_t *data, size_t len) {
     "msg": "connected"
 }
 ```
+
+说明：
+* 如果设备配置为“WiFi 连接成功后关闭 BLE”，则该成功回包发送完成后，BLE 连接可能会被设备主动断开。
+* 连接失败时不会关闭 BLE，便于继续配网。
 
 ### 4.4 查询已保存 WiFi (WiFi Query)
 

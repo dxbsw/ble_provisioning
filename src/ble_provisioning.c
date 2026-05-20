@@ -12,6 +12,8 @@
 static const char *TAG = "BLE_PROV";
 
 static ble_prov_config_t s_config;
+static TaskHandle_t s_ble_stop_task_handle = NULL;
+static TaskHandle_t s_wifi_scan_task_handle = NULL;
 
 esp_err_t ble_prov_config_set_runtime_defaults(const ble_prov_device_config_t *cfg);
 
@@ -29,6 +31,9 @@ static void ble_prov_apply_defaults(ble_prov_config_t *cfg)
     if (cfg->reconnect_continue_after_max == BLE_PROV_OPTION_DEFAULT) {
         cfg->reconnect_continue_after_max = BLE_PROV_OPTION_ENABLE;
     }
+    if (cfg->keep_ble_after_wifi_connected == BLE_PROV_OPTION_DEFAULT) {
+        cfg->keep_ble_after_wifi_connected = BLE_PROV_OPTION_ENABLE;
+    }
     if (cfg->reconnect_fixed_interval_ms == 0) {
         cfg->reconnect_fixed_interval_ms = 60000;
     }
@@ -41,6 +46,27 @@ static void ble_prov_apply_defaults(ble_prov_config_t *cfg)
     if (cfg->reconnect_jitter_ms == 0) {
         cfg->reconnect_jitter_ms = 1000;
     }
+}
+
+static bool ble_prov_should_keep_ble_after_wifi_connected(void)
+{
+    return s_config.keep_ble_after_wifi_connected != BLE_PROV_OPTION_DISABLE;
+}
+
+static void ble_stop_task(void *param)
+{
+    uint32_t delay_ms = (uint32_t)(uintptr_t)param;
+    if (delay_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+
+    esp_err_t err = ble_gatts_module_deinit();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "关闭 BLE 失败: %s", esp_err_to_name(err));
+    }
+
+    s_ble_stop_task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
 /**
@@ -66,8 +92,14 @@ static void prov_task(void *param) {
     }
 
     // 1. 检查是否有保存的 WiFi 配置
-    err = wifi_driver_get_saved_configs(saved_configs, &config_count);
-    if (err == ESP_OK && config_count > 0) {
+    if (!connected) {
+        err = wifi_driver_get_saved_configs(saved_configs, &config_count);
+    } else {
+        err = ESP_OK;
+        config_count = 0;
+    }
+
+    if (!connected && err == ESP_OK && config_count > 0) {
         ESP_LOGI(TAG, "发现 %d 个已保存的 WiFi 配置", config_count);
         
         // 遍历所有保存的配置，按顺序尝试连接
@@ -91,14 +123,13 @@ static void prov_task(void *param) {
 
         if (connected) {
             ESP_LOGI(TAG, "成功连接到 WiFi。配网流程结束。");
-#if BLE_KEEP_ALIVE_AFTER_WIFI_CONNECTED
-            ESP_LOGI(TAG, "BLE 保持连接已启用。正在启动 BLE...");
-            ble_gatts_module_init(s_config.device_name);
-#else
-            ESP_LOGI(TAG, "BLE 保持连接已禁用。BLE 将不会启动（或如果正在运行则停止）。");
-            // 如果 BLE 已经在运行，则停止它。在此流程中它尚未启动，但为了安全起见注释掉：
-            // ble_provisioning_stop(); 
-#endif
+            if (ble_prov_should_keep_ble_after_wifi_connected()) {
+                ESP_LOGI(TAG, "WiFi 已连接，保持 BLE 可用。");
+                ble_gatts_module_init(s_config.device_name);
+            } else {
+                ESP_LOGI(TAG, "WiFi 已连接，按配置关闭 BLE。");
+                ble_provisioning_schedule_stop_if_needed(0);
+            }
             vTaskDelete(NULL);
             return;
         } else {
@@ -116,7 +147,8 @@ static void prov_task(void *param) {
     vTaskDelete(NULL);
 }
 
-static void wifi_scan_notify_task(void *param) {
+static void wifi_scan_notify_task(void *param)
+{
     cJSON *res = cJSON_CreateObject();
     wifi_ap_record_t ap_list[10];
     uint16_t ap_count = 10;
@@ -129,6 +161,7 @@ static void wifi_scan_notify_task(void *param) {
             cJSON_free(json_str);
         }
         cJSON_Delete(res);
+        s_wifi_scan_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
@@ -151,6 +184,7 @@ static void wifi_scan_notify_task(void *param) {
         cJSON_free(json_str);
     }
     cJSON_Delete(res);
+    s_wifi_scan_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
@@ -232,7 +266,7 @@ esp_err_t ble_provisioning_start(void)
 
 esp_err_t ble_provisioning_stop(void)
 {
-    return ble_gatts_module_stop_adv();
+    return ble_gatts_module_deinit();
 }
 
 esp_err_t ble_provisioning_set_reconnect_enabled(bool enabled)
@@ -246,9 +280,50 @@ bool ble_provisioning_is_connected(void)
     return wifi_driver_is_connected();
 }
 
+esp_err_t ble_provisioning_schedule_stop_if_needed(uint32_t delay_ms)
+{
+    if (ble_prov_should_keep_ble_after_wifi_connected()) {
+        return ESP_OK;
+    }
+    if (!wifi_driver_is_connected()) {
+        return ESP_OK;
+    }
+
+    if (delay_ms == 0) {
+        return ble_gatts_module_deinit();
+    }
+
+    if (s_ble_stop_task_handle != NULL) {
+        return ESP_OK;
+    }
+
+    if (xTaskCreate(ble_stop_task,
+                    "ble_stop_task",
+                    3072,
+                    (void *)(uintptr_t)delay_ms,
+                    5,
+                    &s_ble_stop_task_handle) != pdPASS) {
+        s_ble_stop_task_handle = NULL;
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
 esp_err_t ble_provisioning_scan_and_notify(void)
 {
-    if (xTaskCreate(wifi_scan_notify_task, "wifi_scan_notify", 4096, NULL, 5, NULL) != pdPASS) {
+    if (s_wifi_scan_task_handle != NULL) {
+        ESP_LOGI(TAG, "WiFi 扫描已在进行中，复用当前扫描结果");
+        return ESP_OK;
+    }
+
+    if (xTaskCreate(wifi_scan_notify_task,
+                    "wifi_scan_notify",
+                    4096,
+                    NULL,
+                    5,
+                    &s_wifi_scan_task_handle) != pdPASS) {
+        s_wifi_scan_task_handle = NULL;
         return ESP_FAIL;
     }
     return ESP_OK;

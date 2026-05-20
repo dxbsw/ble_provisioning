@@ -1,5 +1,6 @@
 #include "ble_proto_parser.h"
 #include "ble_gatts_module.h"
+#include "ble_provisioning.h"
 #include "wifi_driver.h"
 #include "config.h"
 #include "esp_log.h"
@@ -79,39 +80,11 @@ static esp_err_t handle_connect(cJSON *req, cJSON *res) {
     return ESP_OK;
 }
 
-// WiFi 扫描异步任务
-static void wifi_scan_task(void *param) {
-    cJSON *res = cJSON_CreateObject();
-    wifi_ap_record_t ap_list[10];
-    uint16_t ap_count = 10;
-    
-    esp_err_t err = wifi_driver_scan(ap_list, &ap_count);
+static esp_err_t handle_wifi_scan(cJSON *req, cJSON *res) {
+    esp_err_t err = ble_provisioning_scan_and_notify();
     if (err != ESP_OK) {
         create_response_base(res, CMD_WIFI_SCAN, "fail");
-    } else {
-        create_response_base(res, CMD_WIFI_SCAN, "success");
-        cJSON *scan_res = cJSON_CreateObject();
-        cJSON_AddNumberToObject(scan_res, "count", ap_count);
-        
-        cJSON *list = cJSON_CreateArray();
-        for (int i = 0; i < ap_count; i++) {
-            cJSON *item = cJSON_CreateObject();
-            cJSON_AddStringToObject(item, "ssid", (char *)ap_list[i].ssid);
-            cJSON_AddNumberToObject(item, "rssi", ap_list[i].rssi);
-            cJSON_AddItemToArray(list, item);
-        }
-        cJSON_AddItemToObject(scan_res, "list", list);
-        cJSON_AddItemToObject(res, "scan_res", scan_res);
-    }
-
-    send_async_response(res);
-    vTaskDelete(NULL);
-}
-
-static esp_err_t handle_wifi_scan(cJSON *req, cJSON *res) {
-    if (xTaskCreate(wifi_scan_task, "wifi_scan", 4096, NULL, 5, NULL) != pdPASS) {
-        create_response_base(res, CMD_WIFI_SCAN, "fail");
-        cJSON_AddStringToObject(res, "msg", "task create failed");
+        cJSON_AddStringToObject(res, "msg", "scan start failed");
         return ESP_OK;
     }
     return ESP_BLE_PROTO_ASYNC;
@@ -148,6 +121,9 @@ static void wifi_connect_task(void *param) {
     }
 
     send_async_response(res);
+    if (err == ESP_OK) {
+        ble_provisioning_schedule_stop_if_needed(500);
+    }
     free(params);
     vTaskDelete(NULL);
 }

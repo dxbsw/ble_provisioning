@@ -12,14 +12,6 @@ extern "C" {
 #endif
 
 /**
- * @brief BLE 保持连接配置
- * 
- * 设置为 1：在 WiFi 连接成功后，保持 BLE 广播/连接状态，允许持续通过蓝牙控制。
- * 设置为 0：在 WiFi 连接成功后，关闭 BLE 以节省功耗。
- */
-#define BLE_KEEP_ALIVE_AFTER_WIFI_CONNECTED 1
-
-/**
  * @brief BLE 配网配置结构体
  */
 typedef enum {
@@ -39,6 +31,14 @@ typedef struct {
     ble_prov_option_t reconnect_enable;
     ble_prov_reconnect_mode_t reconnect_mode;
     ble_prov_option_t reconnect_continue_after_max;
+    /**
+     * @brief WiFi 连接成功后是否继续保持 BLE
+     *
+     * - `BLE_PROV_OPTION_ENABLE`：保持 BLE 可用
+     * - `BLE_PROV_OPTION_DISABLE`：关闭 BLE 并释放资源
+     * - `BLE_PROV_OPTION_DEFAULT`：使用组件默认值（当前默认为保持 BLE）
+     */
+    ble_prov_option_t keep_ble_after_wifi_connected;
     uint32_t reconnect_max_attempts;
     uint32_t reconnect_fixed_interval_ms;
     uint32_t reconnect_step_interval_ms;
@@ -122,6 +122,20 @@ esp_err_t ble_provisioning_start(void);
 esp_err_t ble_provisioning_stop(void);
 
 esp_err_t ble_provisioning_set_reconnect_enabled(bool enabled);
+
+/**
+ * @brief 在 WiFi 连接完成后按配置决定是否关闭 BLE
+ *
+ * 当 `keep_ble_after_wifi_connected` 配置为关闭时，该接口会延迟停止 BLE，
+ * 用于给最后一次 Notify 留出发送时间。
+ *
+ * @param delay_ms 延迟关闭 BLE 的毫秒数，0 表示立即关闭
+ * @return
+ *      - ESP_OK: 已处理或无需关闭
+ *      - ESP_FAIL: 创建延时关闭任务失败
+ *      - 其他: 底层 BLE 停止失败
+ */
+esp_err_t ble_provisioning_schedule_stop_if_needed(uint32_t delay_ms);
 
 /**
  * @brief 查询当前 WiFi 是否已连接

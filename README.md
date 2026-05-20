@@ -17,7 +17,7 @@
     *   提供 Python 上位机测试工具。
     *   预留重启前的 Hook 函数，方便二次开发。
     *   支持注册自定义协议处理回调（外部扩展自己的通信协议）。
-    *   BLE 连接建立后自动触发一次 WiFi 扫描，并通过 Notify 上报扫描结果。
+    *   BLE 客户端开启 Notify 后自动触发一次 WiFi 扫描，并通过 Notify 上报扫描结果。
     *   Connect 响应中的 `sys_info / sw_info / state` 字段支持外部传入默认值，并可保存到 NVS 持久化。
 
 ## 目录结构
@@ -55,7 +55,7 @@ ble_provisioning/
 dependencies:
   ble_provisioning:
     git: "https://github.com/dxbsw/ble_provisioning.git"
-    version: "v1.0.5"
+    version: "v1.0.6"
 ```
 
 ### 方式 B：从组件中心（发布后使用）
@@ -63,7 +63,7 @@ dependencies:
 ```yaml
 dependencies:
   dxbsw/ble_provisioning:
-    version: "^1.0.5"
+    version: "^1.0.6"
 ```
 
 ## 依赖 (Dependencies)
@@ -103,6 +103,7 @@ void app_main(void)
     // 定义配置
     ble_prov_config_t config = {
         .device_name = "ESP32-S3-TEXT", // 自定义蓝牙广播名称
+        .keep_ble_after_wifi_connected = BLE_PROV_OPTION_ENABLE,
         .device_info = {
             .sys_name = "ESP32-S3-DEVICE",
             .fw_ver = "1.0.1",
@@ -138,15 +139,23 @@ void app_main(void)
 
 ### 3. 自定义配置
 
-#### 3.1 WiFi 连接后保持 BLE
+#### 3.1 WiFi 连接后是否保持 BLE
 
-在 `include/ble_provisioning.h` 中，可以通过修改宏定义来决定 WiFi 连接成功后是否保持蓝牙开启：
+通过 `ble_prov_config_t.keep_ble_after_wifi_connected` 决定 WiFi 连接成功后是否继续保持蓝牙开启：
 
 ```c
-// 1: 保持开启（默认），允许后续通过蓝牙控制
-// 0: 关闭蓝牙以省电
-#define BLE_KEEP_ALIVE_AFTER_WIFI_CONNECTED 1
+ble_prov_config_t config = {
+    .device_name = "ESP32-S3-TEXT",
+    .keep_ble_after_wifi_connected = BLE_PROV_OPTION_DISABLE,
+};
 ```
+
+说明：
+*   `BLE_PROV_OPTION_ENABLE`：WiFi 连接成功后保持 BLE 可用，方便继续通过蓝牙控制。
+*   `BLE_PROV_OPTION_DISABLE`：WiFi 连接成功后关闭 BLE，并释放 GATT / Bluedroid / Controller 资源。
+*   `BLE_PROV_OPTION_DEFAULT`：使用组件默认值，当前等同于保持 BLE 开启。
+
+> 当配置为关闭 BLE 时，`CMD_WIFI_CONNECT` 成功回包发出后，设备可能会主动断开 BLE 连接，这是预期行为。
 
 #### 3.2 重启钩子 (Hook)
 
@@ -191,6 +200,7 @@ typedef struct {
 ```c
 ble_prov_config_t config = {
     .device_name = "ESP32-S3-TEXT",
+    .keep_ble_after_wifi_connected = BLE_PROV_OPTION_ENABLE,
     .device_info = {
         .sys_name = "ESP32-S3-DEVICE",
         .fw_ver = "1.0.1",
@@ -253,9 +263,9 @@ ESP_ERROR_CHECK(ble_prov_config_get(&current_cfg));
 
 ## 新功能使用示例
 
-### 1) BLE 连接后自动上报 WiFi 扫描结果
+### 1) 开启 Notify 后自动上报一次 WiFi 扫描结果
 
-设备 BLE 连接建立后，会自动触发一次 WiFi 扫描，并通过 Notify 上报（格式与 `CMD_WIFI_SCAN` 的响应一致，详见 `PROTOCOL.md`）。
+设备 BLE 连接建立并且客户端成功开启 `Status Notify` 后，会自动触发一次 WiFi 扫描，并通过 Notify 上报（格式与 `CMD_WIFI_SCAN` 的响应一致，详见 `PROTOCOL.md`）。
 
 如需手动触发，也可以在应用层调用：
 
@@ -334,6 +344,14 @@ void app_main(void)
 
 ## 更新记录
 
+### v1.0.6
+
+*   变更：`ble_prov_config_t` 新增 `keep_ble_after_wifi_connected` 运行时配置，替代原先的编译期宏控制。
+*   修复：`ble_provisioning_stop()` 改为完整释放 BLE 资源，而非仅停止广播。
+*   修复：`CMD_WIFI_SCAN` 统一为扫描完成后通过 Notify 返回结果。
+*   修复：默认 WiFi 连接成功后不再继续遍历已保存 WiFi 列表。
+*   修复：仅在 `CMD_WIFI_CONNECT` 成功后才会按配置关闭 BLE。
+
 ### v1.0.5
 
 *   文档更新：补充 `ble_prov_config_t.device_info` 的外部传参说明，并补充 `ble_prov_config_set()` / `ble_prov_config_get()` 的 NVS 持久化示例。
@@ -366,6 +384,11 @@ void app_main(void)
 4.  **MTU 限制**：
     *   默认 BLE MTU 较小（23 字节）。虽然组件设置了本地 MTU 为 500，但实际传输大小取决于手机/上位机的协商结果。
     *   发送长 JSON 响应时，建议上位机先请求增大 MTU，或在应用层进行分包处理（当前组件通过 Notify 直接发送，如果超过 MTU 可能会被截断）。
+
+5.  **Notify 前置条件**：
+    *   组件所有协议响应都通过 `Status Notify` 返回。
+    *   上位机必须先订阅 Notify，才能收到 Connect / Scan / WiFi Connect 等命令回包。
+    *   首次 WiFi 扫描结果也会在开启 Notify 后自动上报一次。
 
 ## 测试工具
 

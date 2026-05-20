@@ -8,6 +8,9 @@
 #include "esp_gatt_common_api.h"
 #include "esp_bt_defs.h"
 #include "esp_bt_main.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -32,6 +35,11 @@ static uint16_t s_char_status_handle = 0;
 static char s_device_name[32] = "ESP32-BLE-PROV";
 static ble_gatts_custom_proto_handler_t s_custom_proto_handler = NULL;
 static void *s_custom_proto_user_ctx = NULL;
+static bool s_ble_initialized = false;
+static bool s_adv_enabled = false;
+static bool s_notify_enabled = false;
+static bool s_shutdown_in_progress = false;
+static bool s_classic_mem_released = false;
 
 static uint8_t service_uuid128[16] = SERVICE_UUID;
 static uint8_t char_cmd_uuid128[16] = CHAR_CMD_UUID;
@@ -70,6 +78,25 @@ static struct gatts_profile_inst {
     },
 };
 
+static void ble_gatts_reset_runtime_state(void)
+{
+    s_conn_id = 0xffff;
+    s_gatts_if = ESP_GATT_IF_NONE;
+    s_char_cmd_handle = 0;
+    s_char_status_handle = 0;
+    s_adv_enabled = false;
+    s_notify_enabled = false;
+    gl_profile_tab[PROFILE_A_APP_ID].gatts_if = ESP_GATT_IF_NONE;
+    gl_profile_tab[PROFILE_A_APP_ID].conn_id = 0xffff;
+    gl_profile_tab[PROFILE_A_APP_ID].service_handle = 0;
+    gl_profile_tab[PROFILE_A_APP_ID].descr_handle = 0;
+}
+
+static esp_err_t ble_gatts_ignore_invalid_state(esp_err_t err)
+{
+    return (err == ESP_ERR_INVALID_STATE) ? ESP_OK : err;
+}
+
 // GAP 事件处理函数
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
@@ -82,6 +109,15 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         // 广播启动完成事件
         if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
             ESP_LOGE(GATTS_TAG, "广播启动失败");
+            s_adv_enabled = false;
+        } else {
+            s_adv_enabled = true;
+        }
+        break;
+    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+        s_adv_enabled = false;
+        if (param->adv_stop_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGW(GATTS_TAG, "广播停止异常, status=%d", param->adv_stop_cmpl.status);
         }
         break;
     default:
@@ -134,6 +170,13 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
     case ESP_GATTS_WRITE_EVT: {
         ESP_LOGI(GATTS_TAG, "GATT 写入事件, 长度 %d", param->write.len);
         if (!param->write.is_prep) {
+            if (param->write.handle == gl_profile_tab[PROFILE_A_APP_ID].descr_handle && param->write.len >= 2) {
+                uint16_t cccd_value = param->write.value[1] << 8 | param->write.value[0];
+                s_notify_enabled = (cccd_value & 0x0001U) != 0;
+                if (s_notify_enabled) {
+                    ble_provisioning_scan_and_notify();
+                }
+            }
             if (param->write.handle == s_char_cmd_handle) {
                 // 解析命令
                 char response[512]; // 响应缓冲区
@@ -230,6 +273,7 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
         break;
     }
     case ESP_GATTS_ADD_CHAR_DESCR_EVT:
+        gl_profile_tab[PROFILE_A_APP_ID].descr_handle = param->add_char_descr.attr_handle;
         break;
     case ESP_GATTS_DELETE_EVT:
         break;
@@ -249,13 +293,15 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
         s_conn_id = param->connect.conn_id;
         s_gatts_if = gatts_if;
         esp_ble_gap_update_conn_params(&conn_params);
-        ble_provisioning_scan_and_notify();
         break;
     }
     case ESP_GATTS_DISCONNECT_EVT:
         ESP_LOGI(GATTS_TAG, "设备断开连接事件");
         s_conn_id = 0xffff;
-        esp_ble_gap_start_advertising(&test_adv_params);
+        s_notify_enabled = false;
+        if (!s_shutdown_in_progress) {
+            esp_ble_gap_start_advertising(&test_adv_params);
+        }
         break;
     case ESP_GATTS_CONF_EVT:
         if (param->conf.status != ESP_GATT_OK){
@@ -298,31 +344,54 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 
 esp_err_t ble_gatts_module_init(const char *device_name)
 {
+    esp_err_t ret;
+
     if (device_name) {
         snprintf(s_device_name, sizeof(s_device_name), "%s", device_name);
     }
-    
-    // 释放经典蓝牙控制器内存
-    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    esp_err_t ret = esp_bt_controller_init(&bt_cfg);
-    if (ret) {
-        return ret;
+    if (s_ble_initialized) {
+        return ble_gatts_module_start_adv();
     }
 
-    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (ret) {
-        return ret;
+    ble_gatts_reset_runtime_state();
+
+    if (!s_classic_mem_released &&
+        esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE) {
+        ret = ble_gatts_ignore_invalid_state(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        s_classic_mem_released = true;
     }
-    
-    ret = esp_bluedroid_init();
-    if (ret) {
-        return ret;
+
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE) {
+        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+        ret = ble_gatts_ignore_invalid_state(esp_bt_controller_init(&bt_cfg));
+        if (ret != ESP_OK) {
+            return ret;
+        }
     }
-    ret = esp_bluedroid_enable();
-    if (ret) {
-        return ret;
+
+    if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        ret = ble_gatts_ignore_invalid_state(esp_bt_controller_enable(ESP_BT_MODE_BLE));
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED) {
+        ret = ble_gatts_ignore_invalid_state(esp_bluedroid_init());
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) {
+        ret = ble_gatts_ignore_invalid_state(esp_bluedroid_enable());
+        if (ret != ESP_OK) {
+            return ret;
+        }
     }
 
     ret = esp_ble_gatts_register_callback(gatts_event_handler);
@@ -340,17 +409,97 @@ esp_err_t ble_gatts_module_init(const char *device_name)
     
     // 设置本地 MTU
     esp_ble_gatt_set_local_mtu(500);
-    
+
+    s_ble_initialized = true;
     return ESP_OK;
 }
 
 esp_err_t ble_gatts_module_deinit(void)
 {
-    return ESP_OK;
+    esp_err_t ret = ESP_OK;
+    esp_err_t err;
+
+    if (!s_ble_initialized &&
+        esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE &&
+        esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED) {
+        return ESP_OK;
+    }
+
+    s_shutdown_in_progress = true;
+
+    if (s_adv_enabled) {
+        err = ble_gatts_ignore_invalid_state(esp_ble_gap_stop_advertising());
+        if (ret == ESP_OK && err != ESP_OK) {
+            ret = err;
+        }
+    }
+
+    if (s_conn_id != 0xffff && s_gatts_if != ESP_GATT_IF_NONE) {
+        err = ble_gatts_ignore_invalid_state(esp_ble_gatts_close(s_gatts_if, s_conn_id));
+        if (ret == ESP_OK && err != ESP_OK) {
+            ret = err;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    if (gl_profile_tab[PROFILE_A_APP_ID].service_handle != 0) {
+        err = ble_gatts_ignore_invalid_state(
+            esp_ble_gatts_stop_service(gl_profile_tab[PROFILE_A_APP_ID].service_handle));
+        if (ret == ESP_OK && err != ESP_OK) {
+            ret = err;
+        }
+        err = ble_gatts_ignore_invalid_state(
+            esp_ble_gatts_delete_service(gl_profile_tab[PROFILE_A_APP_ID].service_handle));
+        if (ret == ESP_OK && err != ESP_OK) {
+            ret = err;
+        }
+    }
+
+    if (gl_profile_tab[PROFILE_A_APP_ID].gatts_if != ESP_GATT_IF_NONE) {
+        err = ble_gatts_ignore_invalid_state(
+            esp_ble_gatts_app_unregister(gl_profile_tab[PROFILE_A_APP_ID].gatts_if));
+        if (ret == ESP_OK && err != ESP_OK) {
+            ret = err;
+        }
+    }
+
+    if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
+        err = ble_gatts_ignore_invalid_state(esp_bluedroid_disable());
+        if (ret == ESP_OK && err != ESP_OK) {
+            ret = err;
+        }
+    }
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_UNINITIALIZED) {
+        err = ble_gatts_ignore_invalid_state(esp_bluedroid_deinit());
+        if (ret == ESP_OK && err != ESP_OK) {
+            ret = err;
+        }
+    }
+
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        err = ble_gatts_ignore_invalid_state(esp_bt_controller_disable());
+        if (ret == ESP_OK && err != ESP_OK) {
+            ret = err;
+        }
+    }
+    if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_IDLE) {
+        err = ble_gatts_ignore_invalid_state(esp_bt_controller_deinit());
+        if (ret == ESP_OK && err != ESP_OK) {
+            ret = err;
+        }
+    }
+
+    ble_gatts_reset_runtime_state();
+    s_ble_initialized = false;
+    s_shutdown_in_progress = false;
+    return ret;
 }
 
 esp_err_t ble_gatts_module_start_adv(void)
 {
+    if (!s_ble_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
     esp_ble_gap_start_advertising(&test_adv_params);
     return ESP_OK;
 }
@@ -366,6 +515,10 @@ esp_err_t ble_gatts_module_send_notify(const uint8_t *data, size_t len)
     if (s_conn_id == 0xffff || s_gatts_if == ESP_GATT_IF_NONE || s_char_status_handle == 0) {
         ESP_LOGW(GATTS_TAG, "无法发送通知：无连接或句柄无效");
         return ESP_FAIL;
+    }
+    if (!s_notify_enabled) {
+        ESP_LOGW(GATTS_TAG, "无法发送通知：客户端尚未开启 Notify");
+        return ESP_ERR_INVALID_STATE;
     }
     
     return esp_ble_gatts_send_indicate(s_gatts_if, s_conn_id, s_char_status_handle,
